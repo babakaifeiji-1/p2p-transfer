@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<script src="../transfer.js"></script>
+<pre id="result"></pre>
+<script>
+const { Session, memorySink } = P2PTransfer;
+const report = (o) => { document.getElementById('result').textContent = JSON.stringify(o); };
+const plog = () => {};
+
+async function pair() {
+  const a = new RTCPeerConnection(), b = new RTCPeerConnection();
+  a.onicecandidate = (e) => e.candidate && b.addIceCandidate(e.candidate);
+  b.onicecandidate = (e) => e.candidate && a.addIceCandidate(e.candidate);
+  const da = a.createDataChannel('x', { ordered: true });
+  const dbP = new Promise((r) => (b.ondatachannel = (e) => r(e.channel)));
+  await a.setLocalDescription(); await b.setRemoteDescription(a.localDescription);
+  await b.setLocalDescription(); await a.setRemoteDescription(b.localDescription);
+  const db = await dbP;
+  await Promise.all([da, db].map((d) => d.readyState === 'open' ? 0 : new Promise((r) => d.onopen = r)));
+  return [da, db, a, b];
+}
+
+function makeFile(size, seed) {
+  const u = new Uint8Array(size);
+  for (let i = 0; i < size; i++) u[i] = (i * 31 + seed) & 255;
+  return new File([u], `f${seed}.bin`);
+}
+async function same(blob, file) {
+  const [x, y] = await Promise.all([blob.arrayBuffer(), file.arrayBuffer()]);
+  if (x.byteLength !== y.byteLength) return false;
+  const p = new Uint8Array(x), q = new Uint8Array(y);
+  for (let i = 0; i < p.length; i++) if (p[i] !== q[i]) return false;
+  return true;
+}
+const waitFor = (fn, ms = 60000) => new Promise((res, rej) => {
+  const t0 = Date.now();
+  (function loop() { const v = fn(); if (v) return res(v); if (Date.now() - t0 > ms) return rej(new Error('timeout')); setTimeout(loop, 20); })();
+});
+
+window.__done = (async () => {
+  const results = {};
+  try {
+    const [da, db] = await pair();
+    plog('datachannel open');
+    const outA = {}, inB = {};
+    let policy = () => 'accept';
+    let B;
+    const A = new Session(da, { onUpdate: (tx) => (outA[tx.name] = tx) });
+    B = new Session(db, {
+      onUpdate: (tx) => (inB[tx.name] = tx),
+      onOffer: (tx) => setTimeout(() => policy(tx) === 'accept' ? B.accept(tx, memorySink()) : B.reject(tx), 10),
+    });
+
+    // 1. 多文件 + 边界大小（0 字节、恰好一个 chunk、跨 chunk、20MB 测背压）
+    const sizes = [0, 1, 65536, 65537, 300000, 20 * 1024 * 1024];
+    const files = sizes.map((s, i) => makeFile(s, i));
+    const t0 = performance.now();
+    A.sendFiles(files);
+    await waitFor(() => files.every((f) => outA[f.name] && ['done', 'failed'].includes(outA[f.name].state)));
+    results.elapsedMs = Math.round(performance.now() - t0);
+    for (const f of files) {
+      const r = inB[f.name];
+      results['size_' + f.size] = outA[f.name].state === 'done' && r.state === 'done' && await same(r.result, f);
+    }
+
+    // 2. 拒绝
+    policy = () => 'reject';
+    const rf = makeFile(1000, 50);
+    A.sendFiles([rf]);
+    await waitFor(() => outA[rf.name] && outA[rf.name].state === 'rejected');
+    results.reject = inB[rf.name].state === 'rejected';
+
+    // 3. 接收方中途取消，之后还能继续传
+    policy = () => 'accept';
+    const cf = makeFile(30 * 1024 * 1024, 60);
+    A.sendFiles([cf]);
+    await waitFor(() => inB[cf.name] && inB[cf.name].bytes > 1024 * 1024);
+    B.cancel(inB[cf.name]);
+    await waitFor(() => outA[cf.name].state === 'cancelled');
+    results.cancelByReceiver = inB[cf.name].state === 'cancelled';
+    const after = makeFile(123457, 70);
+    A.sendFiles([after]);
+    await waitFor(() => outA[after.name] && outA[after.name].state === 'done');
+    results.afterCancel = await same(inB[after.name].result, after);
+
+    // 4. 反向发送（B -> A）
+    const A2in = {};
+    A.hooks.onOffer = (tx) => A.accept(tx, memorySink());
+    const prevUpd = A.hooks.onUpdate;
+    A.hooks.onUpdate = (tx) => { prevUpd(tx); if (tx.dir === 'in') A2in[tx.name] = tx; };
+    const back = makeFile(500000, 80);
+    B.sendFiles([back]);
+    await waitFor(() => A2in[back.name] && A2in[back.name].state === 'done');
+    results.reverse = await same(A2in[back.name].result, back);
+
+    // 5. 断开时进行中的传输标记为失败
+    const big = makeFile(30 * 1024 * 1024, 90);
+    let closed = '';
+    B.hooks.onClose = (r) => (closed = r);
+    A.sendFiles([big]);
+    await waitFor(() => inB[big.name] && inB[big.name].bytes > 1024 * 1024);
+    da.close();
+    await waitFor(() => closed && outA[big.name].state === 'failed');
+    results.disconnect = inB[big.name].state === 'failed';
+
+    // 6. 文件名清洗
+    results.sanitize = P2PTransfer.sanitizeName('../../etc/passwd') === '.._.._etc_passwd' &&
+      P2PTransfer.sanitizeName('') === 'file';
+  } catch (e) {
+    results.error = String(e && e.stack || e);
+  }
+  report(results);
+  return results;
+})();
+</script>

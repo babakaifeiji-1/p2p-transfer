@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>P2P 文件传输</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main>
+    <h1>P2P 文件传输</h1>
+    <p class="hint">文件在两台电脑之间直接传输（WebRTC，端到端加密），不经过任何服务器存储。</p>
+
+    <section aria-labelledby="pair-title" class="card">
+      <h2 id="pair-title">1. 配对</h2>
+      <div class="row">
+        <span>我的配对码：</span>
+        <strong id="myCode" class="code" aria-live="polite">连接中…</strong>
+        <button id="copyLinkBtn" type="button" disabled>复制邀请链接</button>
+      </div>
+      <form id="connectForm" class="row">
+        <label for="remoteCode">对方配对码：</label>
+        <input id="remoteCode" autocomplete="off" spellcheck="false" maxlength="6"
+               pattern="[A-Za-z0-9]{6}" placeholder="6 位" required>
+        <button id="connectBtn" type="submit" disabled>连接</button>
+        <button id="disconnectBtn" type="button" hidden>断开</button>
+      </form>
+      <p id="status" role="status" aria-live="polite" class="status">正在连接信令服务器…</p>
+    </section>
+
+    <section aria-labelledby="send-title" class="card">
+      <h2 id="send-title">2. 发送文件</h2>
+      <div id="dropZone" class="drop" tabindex="0" role="button" aria-disabled="true"
+           aria-describedby="dropHint">
+        <p id="dropHint">把文件拖到这里，或点击选择文件（可多选）</p>
+      </div>
+      <input id="fileInput" type="file" multiple hidden>
+    </section>
+
+    <section aria-labelledby="list-title" class="card">
+      <h2 id="list-title">传输记录</h2>
+      <ul id="transfers" class="transfers" aria-live="polite"></ul>
+      <p id="emptyHint" class="hint">暂无</p>
+    </section>
+
+    <footer class="hint">
+      <span id="saveMode"></span>
+      · 配对码只在本页面打开期间有效 · <a href="https://github.com/babakaifeiji-1/p2p-transfer">源码</a>
+    </footer>
+  </main>
+
+  <!-- 接收确认对话框 -->
+  <dialog id="offerDialog" aria-labelledby="offerTitle">
+    <form method="dialog">
+      <h2 id="offerTitle">收到文件</h2>
+      <p id="offerText"></p>
+      <div class="row end">
+        <button value="reject" type="submit">拒绝</button>
+        <button value="accept" type="submit" class="primary" autofocus>接收</button>
+      </div>
+    </form>
+  </dialog>
+
+  <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js" crossorigin="anonymous"></script>
+  <script src="config.js"></script>
+  <script src="transfer.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

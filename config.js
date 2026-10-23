@@ -17,15 +17,21 @@ window.P2P_CONFIG = {
   ],
 
   /*
-   * STUN 用于 NAT 打洞，大多数家庭宽带都能直连。
-   * 如果出现"P2P 连接失败"（通常是一方处于对称型 NAT，比如部分 4G/5G 或公司网络），
-   * 可以加一个 TURN 中转服务器，例如 Cloudflare 或 Metered.ca 的免费额度：
-   *   { urls: 'turn:your.turn.server:3478', username: 'xxx', credential: 'yyy' }
-   * TURN 账号会被所有人看到，请使用有流量上限的账号。
+   * STUN 用于 NAT 打洞，大多数家庭宽带都能直连。stun.l.google.com 在国内不可用，所以列了国内可用的备选。
    */
   iceServers: [
-    { urls: 'stun:stun.l.google.com:19302' },
-    { urls: 'stun:stun.cloudflare.com:3478' },
     { urls: 'stun:stun.miwifi.com:3478' },
+    { urls: 'stun:stun.cloudflare.com:3478' },
+    { urls: 'stun:stun.l.google.com:19302' },
+    // 也可以直接在这里写固定的 TURN 账号（会公开在网页上）：
+    // { urls: ['turn:xxx:3478', 'turns:xxx:443?transport=tcp'], username: '...', credential: '...' },
   ],
+
+  /*
+   * TURN 中转：公司网络、手机热点等无法直连的环境需要它（流量经 TURN 服务器转发）。
+   * 填一个返回 iceServers 数组的地址，页面每次连接前会自动获取，例如 Metered.ca：
+   *   'https://<你的应用名>.metered.live/api/v1/turn/credentials?apiKey=<API Key>'
+   * 留空 = 只尝试 P2P 直连。
+   */
+  turnCredentialsUrl: '',
 };

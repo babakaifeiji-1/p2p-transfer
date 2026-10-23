@@ -28,9 +28,15 @@
 页面上会显示"信令通道 N/5 可用"。如果是 0/5，说明当前网络把这些公共服务都拦了（常见于公司网络），换个网络（如手机热点）即可。
 也可以在 `config.js` 的 `relays` 里加别的公共 MQTT Broker（需要支持 WebSocket over TLS）。
 
-如果一方处于对称型 NAT（部分 4G/5G、公司网络），P2P 打洞会失败，页面会提示"连接超时"。
-解决办法：在 `config.js` 的 `iceServers` 中加入 TURN 服务器（Cloudflare、Metered.ca 等有免费额度）。
-注意 `config.js` 是公开的，请使用有流量上限的 TURN 账号。
+如果提示"P2P 连接失败"，页面会列出双方拿到的地址类型（内网 / 公网 / 中转）帮助判断问题在哪一侧。
+公司网络、手机热点通常无法直连，需要 TURN 中转：
+
+1. 注册 [Metered.ca](https://www.metered.ca/) 免费账号，创建 TURN 凭据，复制 API Key 和应用名
+2. 打开页面 →「TURN 中转设置」，填入
+   `https://<应用名>.metered.live/api/v1/turn/credentials?apiKey=<API Key>`，点「保存并测试」
+3. 显示"✓ 可用并已保存"即可，设置只保存在本浏览器。一方配置即可，双方都配置更稳
+
+也可以直接粘贴 iceServers JSON 数组，或在 `config.js` 的 `turnCredentialsUrl` 中设置全站默认值（会公开）。
 
 ## 测试
 

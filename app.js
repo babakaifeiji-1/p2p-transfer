@@ -44,6 +44,7 @@
 
   function setStatus(text, kind) {
     ui.status.textContent = text;
+    ui.status.style.whiteSpace = 'pre-line';
     ui.status.className = 'status' + (kind ? ' ' + kind : '');
   }
 
@@ -121,12 +122,54 @@
 
   /* ---------------- WebRTC 连接 ---------------- */
 
+  // ICE 服务器 = config.js 中的静态配置 + TURN（页面设置优先，其次 config.js 的 turnCredentialsUrl）
+  //   TURN 设置可以是返回 iceServers 数组的 URL，也可以直接是 iceServers 的 JSON 数组
+  const TURN_KEY = 'p2p-turn';
+  let turnCache = { at: 0, src: '', servers: [] };
+  const validServers = (list) => Array.isArray(list) && list.length > 0 &&
+    list.every((s) => s && (typeof s.urls === 'string' || Array.isArray(s.urls)));
+
+  async function loadTurn(src) {
+    src = String(src || '').trim();
+    if (!src) return [];
+    if (src.startsWith('[') || src.startsWith('{')) {
+      const v = JSON.parse(src);
+      const list = Array.isArray(v) ? v : [v];
+      if (!validServers(list)) throw new Error('JSON 格式不对，应为 [{"urls": "...", "username": "...", "credential": "..."}]');
+      return list;
+    }
+    if (!/^https:\/\//.test(src)) throw new Error('地址需以 https:// 开头');
+    const res = await fetch(src, { credentials: 'omit', referrerPolicy: 'no-referrer' });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const list = await res.json();
+    if (!validServers(list)) throw new Error('返回内容不是 iceServers 数组');
+    return list;
+  }
+
+  async function getIceServers() {
+    const servers = (cfg.iceServers || []).slice();
+    const src = localStorage.getItem(TURN_KEY) || cfg.turnCredentialsUrl || '';
+    if (src) {
+      if (turnCache.src !== src || Date.now() - turnCache.at > 30 * 60 * 1000) {
+        try {
+          turnCache = { at: Date.now(), src, servers: await loadTurn(src) };
+        } catch (e) {
+          console.warn('获取 TURN 账号失败', e);
+          turnCache = { at: 0, src: '', servers: [] };
+        }
+      }
+      servers.push(...turnCache.servers);
+    }
+    return servers;
+  }
+  const hasTurn = (servers) => (servers || []).some((s) => [].concat(s.urls).some((u) => /^turns?:/.test(u)));
+
   function newPeerConnection(l) {
-    const pc = new RTCPeerConnection({ iceServers: cfg.iceServers || [] });
+    const pc = new RTCPeerConnection({ iceServers: l.iceServers });
     pc.addEventListener('connectionstatechange', () => {
       if (link !== l) return;
       if (pc.connectionState === 'failed') {
-        fail('P2P 连接失败：双方网络可能无法直连（对称型 NAT）。可在 config.js 中配置 TURN 中转服务器。');
+        failWithDiagnosis(l, 'P2P 连接失败');
       } else if (pc.connectionState === 'disconnected' && session) {
         setStatus('连接不稳定，正在尝试恢复…', 'err');
       } else if (pc.connectionState === 'connected' && session) {
@@ -136,19 +179,70 @@
     return pc;
   }
 
-  // 非 trickle 模式：等本机候选地址收集完（或超时）再一次性发送 SDP，信令消息更少
-  function gathered(pc) {
+  /*
+   * 非 trickle 模式：等本机候选地址收集完再一次性发送 SDP，信令消息更少。
+   * 某些 STUN 在国内连不上会拖慢"收集完成"，所以：拿到中转地址就提前结束；否则最多等 timeout。
+   * TURN over TLS 握手较慢，配置了 TURN 时多等一会儿。
+   */
+  function gathered(pc, withTurn) {
     if (pc.iceGatheringState === 'complete') return Promise.resolve();
     return new Promise((resolve) => {
-      const t = setTimeout(done, ICE_GATHER_TIMEOUT);
+      let early = null;
+      const t = setTimeout(done, withTurn ? 8000 : ICE_GATHER_TIMEOUT);
       function done() {
         clearTimeout(t);
+        clearTimeout(early);
         pc.removeEventListener('icegatheringstatechange', check);
+        pc.removeEventListener('icecandidate', onCand);
         resolve();
       }
       function check() { if (pc.iceGatheringState === 'complete') done(); }
+      function onCand(e) {
+        if (e.candidate && / typ relay /.test(e.candidate.candidate) && !early) early = setTimeout(done, 500);
+      }
       pc.addEventListener('icegatheringstatechange', check);
+      pc.addEventListener('icecandidate', onCand);
     });
+  }
+
+  /* ---------------- 连接诊断 ---------------- */
+
+  // 统计 SDP 里各类候选地址：host=本机/内网地址，srflx=经 STUN 查到的公网地址，relay=TURN 中转地址
+  function summarize(sdp) {
+    const s = { host: 0, srflx: 0, relay: 0, tcp: 0, ipv6: 0 };
+    for (const line of String(sdp || '').split(/\r?\n/)) {
+      const m = /^a=candidate:\S+ \d+ (\S+) \d+ (\S+) \d+ typ (\S+)/.exec(line);
+      if (!m) continue;
+      if (m[3] in s) s[m[3]]++;
+      if (m[1].toLowerCase() === 'tcp') s.tcp++;
+      if (m[2].includes(':')) s.ipv6++;
+    }
+    return s;
+  }
+  const fmtSummary = (s) =>
+    `内网地址${s.host ? '✓' : '✗'} 公网地址${s.srflx ? '✓' : '✗'} 中转地址${s.relay ? '✓' : '✗'}`;
+
+  function diagnose(l) {
+    const local = summarize(l.pc && l.pc.localDescription && l.pc.localDescription.sdp);
+    const remote = summarize(l.pc && l.pc.remoteDescription && l.pc.remoteDescription.sdp);
+    const lines = [`本机：${fmtSummary(local)}`, `对方：${fmtSummary(remote)}`];
+    const turn = hasTurn(l.iceServers);
+    if (!turn) {
+      lines.push('未配置 TURN 中转。公司网络、手机热点等环境通常必须通过 TURN 才能连通，可在上方「TURN 中转设置」里填写。');
+    } else if (!local.relay && !remote.relay) {
+      lines.push('已配置 TURN，但双方都没拿到中转地址：TURN 账号可能无效/额度用完，或 TURN 服务器被网络屏蔽。');
+    } else if (!local.relay || !remote.relay) {
+      lines.push(`${local.relay ? '对方' : '本机'}没拿到中转地址，该侧网络可能屏蔽了 TURN 服务器。`);
+    }
+    if (!local.srflx && !local.relay) lines.push('本机连 STUN 都失败了，当前网络很可能屏蔽了 UDP。');
+    if (!remote.srflx && !remote.relay && l.pc && l.pc.remoteDescription) lines.push('对方连 STUN 都失败了，对方网络很可能屏蔽了 UDP。');
+    return lines.join('\n');
+  }
+
+  function failWithDiagnosis(l, title) {
+    const text = title + '。\n' + diagnose(l);
+    console.warn(text);
+    fail(text);
   }
 
   function bindChannel(l, dc) {
@@ -177,10 +271,12 @@
     setConnectedUI('connecting');
     setStatus('正在连接 ' + code + ' …');
     try {
+      l.iceServers = await getIceServers();
+      if (link !== l) return;
       l.pc = newPeerConnection(l);
       bindChannel(l, l.pc.createDataChannel('file', { ordered: true }));
       await l.pc.setLocalDescription(await l.pc.createOffer());
-      await gathered(l.pc);
+      await gathered(l.pc, hasTurn(l.iceServers));
       if (link !== l) return;
       const offer = { t: 'offer', sid: l.sid, sdp: l.pc.localDescription.sdp };
       const sendOffer = () => {
@@ -194,9 +290,8 @@
       l.timers.push(setInterval(sendOffer, OFFER_RESEND));
       l.timers.push(setTimeout(() => {
         if (link !== l || session) return;
-        fail(l.answered
-          ? '连接超时：双方网络可能无法直连（对称型 NAT）。可在 config.js 中配置 TURN 中转服务器。'
-          : '对方没有响应：请确认对方页面已打开、配对码正确。');
+        if (l.answered) failWithDiagnosis(l, '连接超时');
+        else fail('对方没有响应：请确认对方页面已打开、配对码正确。');
       }, CONNECT_TIMEOUT));
     } catch (e) {
       fail('无法创建连接：' + e.message);
@@ -224,16 +319,18 @@
     setConnectedUI('connecting');
     setStatus(from + ' 正在连接你…');
     try {
+      l.iceServers = await getIceServers();
+      if (link !== l) return;
       l.pc = newPeerConnection(l);
       l.pc.addEventListener('datachannel', (e) => bindChannel(l, e.channel));
       await l.pc.setRemoteDescription({ type: 'offer', sdp: String(msg.sdp) });
       await l.pc.setLocalDescription(await l.pc.createAnswer());
-      await gathered(l.pc);
+      await gathered(l.pc, hasTurn(l.iceServers));
       if (link !== l) return;
       l.answer = { t: 'answer', sid: l.sid, sdp: l.pc.localDescription.sdp };
       signaling.send(from, l.answer);
       l.timers.push(setTimeout(() => {
-        if (link === l && !session) fail('连接超时：双方网络可能无法直连（对称型 NAT）。可在 config.js 中配置 TURN 中转服务器。');
+        if (link === l && !session) failWithDiagnosis(l, '连接超时');
       }, CONNECT_TIMEOUT));
     } catch (e) {
       fail('无法建立连接：' + e.message);
@@ -429,6 +526,59 @@
       r.meta.append(' · ', r.link);
     }
   }
+
+  /* ---------------- TURN 设置 ---------------- */
+
+  // 只用 TURN（iceTransportPolicy=relay）收集候选地址，能拿到中转地址说明账号有效、网络能连上 TURN
+  async function testTurn(servers) {
+    const pc = new RTCPeerConnection({ iceServers: servers, iceTransportPolicy: 'relay' });
+    const protos = new Set();
+    try {
+      pc.createDataChannel('t');
+      const done = new Promise((resolve) => {
+        const t = setTimeout(resolve, 10000);
+        pc.addEventListener('icecandidate', (e) => {
+          if (!e.candidate) { clearTimeout(t); resolve(); return; }
+          if (/ typ relay /.test(e.candidate.candidate)) protos.add(e.candidate.relayProtocol || 'ok');
+        });
+      });
+      await pc.setLocalDescription(await pc.createOffer());
+      await done;
+    } finally {
+      pc.close();
+    }
+    return [...protos];
+  }
+
+  const turnStatus = (t, kind) => { $('turnStatus').textContent = t; $('turnStatus').className = 'hint' + (kind ? ' ' + kind : ''); };
+  $('turnInput').value = localStorage.getItem(TURN_KEY) || '';
+  if (localStorage.getItem(TURN_KEY)) turnStatus('已设置');
+  else if (cfg.turnCredentialsUrl) turnStatus('使用网站默认 TURN 配置');
+  $('turnForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const src = $('turnInput').value.trim();
+    if (!src) { turnStatus('请先填写', 'err'); return; }
+    turnStatus('测试中…（最多 10 秒）');
+    try {
+      const servers = await loadTurn(src);
+      const protos = await testTurn(servers);
+      if (!protos.length) {
+        turnStatus('没拿到中转地址：账号无效、额度用完，或当前网络连不上该 TURN 服务器。未保存。', 'err');
+        return;
+      }
+      localStorage.setItem(TURN_KEY, src);
+      turnCache = { at: 0, src: '', servers: [] };
+      turnStatus('✓ 可用并已保存（' + protos.join(' / ').toUpperCase() + '）', 'ok');
+    } catch (err) {
+      turnStatus('失败：' + err.message, 'err');
+    }
+  });
+  $('turnClear').addEventListener('click', () => {
+    localStorage.removeItem(TURN_KEY);
+    turnCache = { at: 0, src: '', servers: [] };
+    $('turnInput').value = '';
+    turnStatus('已清除');
+  });
 
   /* ---------------- 其它交互 ---------------- */
 

@@ -28,6 +28,22 @@
       </form>
       <p id="status" role="status" aria-live="polite" class="status">正在启动…</p>
       <p id="relayStatus" class="hint"></p>
+      <details id="turnBox">
+        <summary>TURN 中转设置（公司网络 / 手机热点连不上时需要）</summary>
+        <form id="turnForm">
+          <p class="hint">
+            填 TURN 账号获取地址（例如 Metered.ca：<code>https://应用名.metered.live/api/v1/turn/credentials?apiKey=…</code>），
+            或直接粘贴 iceServers 的 JSON 数组。只保存在本浏览器，不会上传。通常一方配置即可，双方都配置更稳。
+          </p>
+          <label for="turnInput" class="visually-hidden">TURN 设置</label>
+          <textarea id="turnInput" rows="3" spellcheck="false" autocomplete="off"></textarea>
+          <div class="row">
+            <button type="submit">保存并测试</button>
+            <button type="button" id="turnClear">清除</button>
+            <span id="turnStatus" class="hint" role="status" aria-live="polite"></span>
+          </div>
+        </form>
+      </details>
     </section>
 
     <section aria-labelledby="send-title" class="card">

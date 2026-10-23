@@ -87,6 +87,34 @@ window.__done = (async () => {
     await waitFor(() => /已取消/.test($A('status').textContent) && !$A('connectBtn').disabled);
     r.cancelPending = true;
 
+    // TURN 设置：格式错误 / 不可用的 TURN 不应被保存
+    $A('turnInput').value = 'not a url';
+    $A('turnForm').requestSubmit();
+    await waitFor(() => /失败/.test($A('turnStatus').textContent));
+    r.turnRejectsBadInput = !A.localStorage.getItem('p2p-turn');
+    $A('turnInput').value = '[{"urls":"turn:127.0.0.1:9","username":"u","credential":"p"}]';
+    $A('turnForm').requestSubmit();
+    await waitFor(() => /没拿到中转地址/.test($A('turnStatus').textContent), 20000);
+    r.turnRejectsUnreachable = !A.localStorage.getItem('p2p-turn');
+
+    // 连接失败时给出诊断：两边都把候选地址从 SDP 中去掉，模拟"谁也连不上谁"
+    for (const W of [A, B]) {
+      const desc = Object.getOwnPropertyDescriptor(W.RTCPeerConnection.prototype, 'localDescription');
+      Object.defineProperty(W.RTCPeerConnection.prototype, 'localDescription', {
+        configurable: true,
+        get() {
+          const d = desc.get.call(this);
+          return d && { type: d.type, sdp: d.sdp.split('\r\n').filter((l) => !l.startsWith('a=candidate')).join('\r\n') };
+        },
+      });
+    }
+    $A('remoteCode').value = codeB;
+    $A('connectForm').requestSubmit();
+    await waitFor(() => /连接失败|连接超时/.test($A('status').textContent), 45000);
+    const diag = $A('status').textContent;
+    r.diagnosis = /本机：内网地址✗ 公网地址✗ 中转地址✗/.test(diag) && /对方：/.test(diag) && /未配置 TURN/.test(diag);
+    if (!r.diagnosis) r.diagText = diag;
+
     r.noErrors = (A.__errs || []).length === 0 && (B.__errs || []).length === 0;
     if (!r.noErrors) r.errs = [...(A.__errs || []), ...(B.__errs || [])].join(' | ');
   } catch (e) {

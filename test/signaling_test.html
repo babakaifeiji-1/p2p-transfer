@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<script src="../signaling.js"></script>
+<script>
+const { Mqtt, seal, unseal, deriveSecrets, Signaling } = P2PSignal;
+const enc = new TextEncoder(), dec = new TextDecoder();
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// 内存中的假中继：同一个 bus 上的所有实例互通，可以设置丢包
+function makeBus() { return { subs: new Map() }; }
+function fakeRelay(bus, name, opts = {}) {
+  return {
+    name, state: 'idle',
+    start(topic, onData, onState) {
+      this.topic = topic; this.state = 'open';
+      if (!bus.subs.has(topic)) bus.subs.set(topic, []);
+      bus.subs.get(topic).push((d) => onData(d, name));
+      onState(this);
+    },
+    publish(topic, data) {
+      if (opts.down) return false;
+      (bus.subs.get(topic) || []).forEach((f) => setTimeout(() => f(opts.tamper ? 'A' + data.slice(1) : data), 5));
+      return true;
+    },
+    stop() { this.state = 'closed'; },
+  };
+}
+
+window.__done = (async () => {
+  const r = {};
+  try {
+    // ---- MQTT 编解码 ----
+    const got = [];
+    const parse = Mqtt.parser((p) => got.push(p));
+    const big = 'x'.repeat(20000); // 剩余长度需要 3 字节
+    const p1 = Mqtt.publish('t/a', enc.encode('hello'));
+    const p2 = Mqtt.publish('t/b', enc.encode(big));
+    const all = new Uint8Array([...p1, ...p2, 0xd0, 0x00]); // 两个 PUBLISH + PINGRESP 粘在一起
+    for (let i = 0; i < all.length; i += 7) parse(all.slice(i, i + 7).buffer); // 7 字节一片地喂
+    r.mqttParse = got.length === 3 && got[0].topic === 't/a' && dec.decode(got[0].payload) === 'hello' &&
+      got[1].topic === 't/b' && dec.decode(got[1].payload) === big && got[2].type === 13;
+    r.mqttRemLen = [0, 127, 128, 16383, 16384, 2097151].every((n) => {
+      const b = Mqtt.remainingLength(n);
+      let v = 0, m = 1;
+      for (const x of b) { v += (x & 127) * m; m *= 128; }
+      return v === n && b.length === (n < 128 ? 1 : n < 16384 ? 2 : 3);
+    });
+    const c = Mqtt.connect('abc', 60);
+    r.mqttConnect = c[0] === 0x10 && dec.decode(c.slice(4, 8)) === 'MQTT' && c[8] === 4 && c[9] === 2;
+
+    // ---- 加密 ----
+    const a = await deriveSecrets('ABC234'), b = await deriveSecrets('XYZ789');
+    const a2 = await deriveSecrets('ABC234');
+    r.deriveStable = a.topic === a2.topic && a.topic !== b.topic && /^[0-9a-f]{32}$/.test(a.topic);
+    const sdp = 'v=0\r\n' + 'a=candidate:1 1 udp 2122260223 192.168.1.2 54321 typ host\r\n'.repeat(20);
+    const box = await seal(a.key, { sdp });
+    r.sealRoundtrip = (await unseal(a.key, box)).sdp === sdp;
+    r.sealCompressed = box.length < sdp.length; // 重复内容应被压缩
+    r.wrongKey = (await unseal(b.key, box)) === null;
+    const raw = atob(box); const t = raw.slice(0, 20) + String.fromCharCode(raw.charCodeAt(20) ^ 1) + raw.slice(21);
+    r.tamper = (await unseal(a.key, btoa(t))) === null;
+    r.garbage = (await unseal(a.key, '!!!notbase64')) === null;
+
+    // ---- 信令总线：多中继去重、部分中继不可用、篡改的中继 ----
+    const bus = makeBus();
+    const inbox = { A: [], B: [] };
+    const mk = (code, relays) => {
+      const s = new Signaling({ relays, onMessage: (m) => inbox[code === 'AAAAAA' ? 'A' : 'B'].push(m) });
+      return s.start(code).then(() => s);
+    };
+    const sA = await mk('AAAAAA', [fakeRelay(bus, 'r1'), fakeRelay(bus, 'r2'), fakeRelay(bus, 'down', { down: true })]);
+    const sB = await mk('BBBBBB', [fakeRelay(bus, 'r1'), fakeRelay(bus, 'r2'), fakeRelay(bus, 'evil', { tamper: true })]);
+    const sent = await sA.send('BBBBBB', { t: 'offer', sid: 's1', sdp: 'x' });
+    await sleep(100);
+    r.sentCount = sent === 2;
+    r.dedup = inbox.B.length === 1 && inbox.B[0].from === 'AAAAAA' && inbox.B[0].t === 'offer';
+    r.notToSelf = inbox.A.length === 0;
+    await sB.send('AAAAAA', { t: 'answer', sid: 's1', sdp: 'y' });
+    await sleep(100);
+    r.reply = inbox.A.length === 1 && inbox.A[0].sdp === 'y';
+    // 第三方（不知道 B 的密钥）拿不到内容：用 C 的身份去订阅 B 的 topic
+    const leaked = [];
+    const bTopic = (await deriveSecrets('BBBBBB')).topic;
+    bus.subs.get(bTopic).push((d) => leaked.push(d));
+    await sA.send('BBBBBB', { t: 'offer', sid: 's2', sdp: 'secret-sdp' });
+    await sleep(100);
+    r.encryptedOnWire = leaked.length > 0 && leaked.every((d) => !d.includes('secret') && !d.includes('AAAAAA'));
+
+    // ---- 真实中继类 + 模拟 WebSocket（MQTT broker / ntfy 行为）----
+    const RealWS = window.WebSocket, realFetch = window.fetch;
+    const subs = new Map(); // topic -> Set(ws)
+    const sockets = [];
+    class FakeWS extends EventTarget {
+      constructor(url, proto) {
+        super(); this.url = url; this.proto = proto; this.readyState = 0; sockets.push(this);
+        this.isNtfy = url.startsWith('wss://ntfy.test/');
+        this.parse = Mqtt.parser((p) => this._mqtt(p));
+        setTimeout(() => {
+          if (this.refuse) return this.close();
+          this.readyState = 1; this.dispatchEvent(new Event('open'));
+          if (this.isNtfy) {
+            const topic = url.split('/')[3];
+            if (!subs.has(topic)) subs.set(topic, new Set());
+            subs.get(topic).add(this);
+            this._recv(JSON.stringify({ event: 'open' }));
+          }
+        }, 5);
+      }
+      _recv(data) { setTimeout(() => this.readyState === 1 && this.dispatchEvent(new MessageEvent('message', { data })), 1); }
+      _mqtt(p) {
+        if (p.type === 1) this._recv(Uint8Array.of(0x20, 2, 0, 0).buffer); // CONNACK
+        if (p.type === 8) { // SUBSCRIBE
+          const tl = (p.body[2] << 8) | p.body[3];
+          const topic = new TextDecoder().decode(p.body.subarray(4, 4 + tl));
+          if (!subs.has(topic)) subs.set(topic, new Set());
+          subs.get(topic).add(this);
+          this._recv(Uint8Array.of(0x90, 3, p.body[0], p.body[1], 0).buffer); // SUBACK，拆成两帧发送测试拼包
+        }
+        if (p.type === 3) {
+          for (const ws of subs.get(p.topic) || []) {
+            const pkt = Mqtt.publish(p.topic, p.payload);
+            ws._recv(pkt.slice(0, 3).buffer); ws._recv(pkt.slice(3).buffer);
+          }
+        }
+      }
+      send(data) { if (this.readyState !== 1) throw new Error('not open'); this.parse(data instanceof Uint8Array ? data.slice().buffer : data); }
+      close() {
+        if (this.readyState === 3) return;
+        this.readyState = 3;
+        for (const s of subs.values()) s.delete(this);
+        setTimeout(() => this.dispatchEvent(new Event('close')), 1);
+      }
+    }
+    window.WebSocket = FakeWS;
+    window.fetch = async (url, init) => { // ntfy 发布
+      const u = new URL(url);
+      for (const ws of subs.get(u.pathname.slice(1)) || []) ws._recv(JSON.stringify({ event: 'message', message: init.body }));
+      return new Response(null, { status: 200 });
+    };
+    try {
+      const got = { C: [], D: [] };
+      const relaysFor = () => [
+        { type: 'mqtt', name: 'm', url: 'wss://mqtt.test/mqtt', username: 'u', password: 'p' },
+        { type: 'ntfy', name: 'n', url: 'https://ntfy.test' },
+      ];
+      const sC = new Signaling({ relays: relaysFor(), onMessage: (m) => got.C.push(m) });
+      const sD = new Signaling({ relays: relaysFor(), onMessage: (m) => got.D.push(m) });
+      await sC.start('CCCCCC'); await sD.start('DDDDDD');
+      await sleep(100);
+      r.relaysOpen = sC.openCount() === 2 && sD.openCount() === 2;
+      r.mqttSubprotocol = sockets.some((s) => s.proto === 'mqtt');
+      const n = await sC.send('DDDDDD', { t: 'offer', sid: 'q', sdp: 'z'.repeat(1500) });
+      await sleep(100);
+      r.realRelaysDeliver = n === 2 && got.D.length === 1 && got.D[0].sdp.length === 1500 && got.D[0].via;
+      // 断线后自动重连
+      const mq = sD.relays[0];
+      mq.ws.close();
+      await sleep(50);
+      r.detectsDrop = mq.state === 'closed';
+      await sleep(2300); // 首次重连延迟 2 秒
+      r.reconnects = mq.state === 'open';
+      await sC.send('DDDDDD', { t: 'offer', sid: 'q2', sdp: 'after' });
+      await sleep(100);
+      r.deliverAfterReconnect = got.D.length === 2 && got.D[1].sdp === 'after';
+      sC.stop(); sD.stop();
+      await sleep(20);
+      r.stopCloses = sC.status().every((x) => x.state === 'closed');
+    } finally {
+      window.WebSocket = RealWS; window.fetch = realFetch;
+    }
+  } catch (e) {
+    r.error = String(e && e.stack || e);
+  }
+  return r;
+})();
+</script>

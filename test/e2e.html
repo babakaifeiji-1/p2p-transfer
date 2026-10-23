@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<meta charset="utf-8">
+<!--
+  端到端测试：同一页面里放两个 iframe 各运行一份完整的应用（index.html），
+  run_test.py 会注入一个内存假中继替代公共信令服务器，然后模拟用户操作：
+  B 输入 A 的配对码 -> 建立 WebRTC 连接 -> A 发文件 -> B 点接收 -> 校验内容 -> A 断开 -> B 收到通知
+-->
+<iframe id="A" style="width:600px;height:400px"></iframe>
+<iframe id="B" style="width:600px;height:400px"></iframe>
+<script>
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const waitFor = async (fn, ms = 20000) => {
+  const t0 = Date.now();
+  for (;;) {
+    const v = fn();
+    if (v) return v;
+    if (Date.now() - t0 > ms) throw new Error('timeout waiting for: ' + fn.toString().slice(0, 120));
+    await sleep(50);
+  }
+};
+const load = (id) => new Promise((res) => {
+  const f = document.getElementById(id);
+  f.onload = () => res(f.contentWindow);
+  f.src = '../index.html';
+});
+
+window.__done = (async () => {
+  const r = {};
+  try {
+    sessionStorage.clear();
+    const A = await load('A');
+    const codeA = await waitFor(() => /^[A-Z0-9]{6}$/.test(A.document.getElementById('myCode').textContent) && A.document.getElementById('myCode').textContent);
+    sessionStorage.clear(); // 两个 iframe 共享 sessionStorage，清掉让 B 生成不同的配对码
+    const B = await load('B');
+    const $A = (id) => A.document.getElementById(id), $B = (id) => B.document.getElementById(id);
+    const codeB = await waitFor(() => /^[A-Z0-9]{6}$/.test($B('myCode').textContent) && $B('myCode').textContent);
+    r.distinctCodes = codeA !== codeB;
+    await waitFor(() => !$B('connectBtn').disabled);
+    r.relayStatusShown = /信令通道 1\/1 可用/.test($B('relayStatus').textContent);
+
+    // B 连接 A
+    $B('remoteCode').value = codeA;
+    $B('connectForm').requestSubmit();
+    await waitFor(() => /已连接/.test($A('status').textContent) && /已连接/.test($B('status').textContent));
+    r.connected = true;
+    r.dropEnabled = $A('dropZone').getAttribute('aria-disabled') === 'false';
+
+    // A 发送文件（通过文件选择框）
+    const size = 3 * 1024 * 1024 + 17;
+    const data = new Uint8Array(size);
+    for (let i = 0; i < size; i++) data[i] = (i * 7 + 3) & 255;
+    const dt = new A.DataTransfer();
+    dt.items.add(new A.File([data], '测试 文件.bin'));
+    $A('fileInput').files = dt.files;
+    $A('fileInput').dispatchEvent(new A.Event('change'));
+
+    // B 弹出确认框，点"接收"
+    await waitFor(() => $B('offerDialog').open);
+    r.offerText = /测试 文件\.bin/.test($B('offerText').textContent);
+    $B('offerDialog').querySelector('button[value="accept"]').click();
+
+    const link = await waitFor(() => B.document.querySelector('#transfers a[download]'));
+    const got = new Uint8Array(await (await B.fetch(link.href)).arrayBuffer());
+    r.contentMatches = got.length === size && got.every((v, i) => v === data[i]);
+    r.fileName = link.download === '测试 文件.bin';
+    await waitFor(() => /完成/.test(A.document.querySelector('#transfers .tx-meta').textContent));
+    r.senderDone = true;
+
+    // A 断开，B 应收到通知并恢复到可连接状态
+    $A('disconnectBtn').click();
+    await waitFor(() => /断开/.test($B('status').textContent) && !$B('connectBtn').disabled);
+    r.remoteNotified = true;
+
+    // 断开后可以再次连接（这次 A 主动连 B）
+    $A('remoteCode').value = codeB;
+    $A('connectForm').requestSubmit();
+    await waitFor(() => /已连接/.test($A('status').textContent) && /已连接/.test($B('status').textContent));
+    r.reconnect = true;
+
+    // 连接不存在的配对码：应在超时后提示（这里只检查进入"正在连接"并可取消）
+    $A('disconnectBtn').click();
+    await waitFor(() => !$A('connectBtn').disabled);
+    $A('remoteCode').value = 'ZZZZZZ';
+    $A('connectForm').requestSubmit();
+    await waitFor(() => /正在连接 ZZZZZZ/.test($A('status').textContent));
+    $A('disconnectBtn').click();
+    await waitFor(() => /已取消/.test($A('status').textContent) && !$A('connectBtn').disabled);
+    r.cancelPending = true;
+
+    r.noErrors = (A.__errs || []).length === 0 && (B.__errs || []).length === 0;
+    if (!r.noErrors) r.errs = [...(A.__errs || []), ...(B.__errs || [])].join(' | ');
+  } catch (e) {
+    r.error = String(e && e.stack || e);
+    try { r.statusA = A_status(); } catch (_) { /* ignore */ }
+  }
+  return r;
+})();
+function A_status() {
+  return ['A', 'B'].map((id) => document.getElementById(id).contentDocument.getElementById('status').textContent).join(' || ');
+}
+</script>

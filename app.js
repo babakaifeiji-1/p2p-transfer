@@ -1,25 +1,28 @@
 'use strict';
 (function () {
   const { Session, memorySink, diskSink } = window.P2PTransfer;
+  const { Signaling, randomId } = window.P2PSignal;
   const cfg = window.P2P_CONFIG || {};
 
-  const ID_PREFIX = 'bkfj-p2pft-';                       // 避免与其他使用 PeerJS 公共服务器的应用撞 ID
   const ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';   // 去掉易混淆的 0/O/1/I/L
   const CODE_RE = /^[A-Z0-9]{6}$/;
   const MEMORY_WARN = 1024 * 1024 * 1024;               // 内存模式下超过 1GB 提示
+  const CONNECT_TIMEOUT = 30000;                         // 发起连接后多久放弃
+  const OFFER_RESEND = 3000;                             // 没收到应答时重发 offer 的间隔
+  const ICE_GATHER_TIMEOUT = 3000;                       // 收集本机候选地址的最长等待
   const canSaveToDisk = typeof window.showSaveFilePicker === 'function';
 
   const $ = (id) => document.getElementById(id);
   const ui = {
     myCode: $('myCode'), copyLink: $('copyLinkBtn'), form: $('connectForm'), remote: $('remoteCode'),
-    connect: $('connectBtn'), disconnect: $('disconnectBtn'), status: $('status'),
+    connect: $('connectBtn'), disconnect: $('disconnectBtn'), status: $('status'), relays: $('relayStatus'),
     drop: $('dropZone'), file: $('fileInput'), list: $('transfers'), empty: $('emptyHint'),
     saveMode: $('saveMode'), dialog: $('offerDialog'), offerText: $('offerText'),
   };
 
-  let peer = null;
+  let signaling = null;
   let myCode = '';
-  let conn = null;       // PeerJS DataConnection
+  let link = null;       // 当前 WebRTC 连接 {sid, remote, pc, role, timers, answer}
   let session = null;    // 传输会话
   let pendingConnect = (location.hash.slice(1) || '').toUpperCase();
   const rows = new Map(); // tx.id+dir -> {li, ...}
@@ -44,118 +47,201 @@
     ui.status.className = 'status' + (kind ? ' ' + kind : '');
   }
 
-  function setConnectedUI(connected) {
-    ui.connect.disabled = connected || !myCode;
-    ui.remote.disabled = connected;
-    ui.disconnect.hidden = !connected;
-    ui.drop.setAttribute('aria-disabled', String(!connected));
+  function setConnectedUI(state) { // state: 'idle' | 'connecting' | 'connected'
+    const ready = signaling && signaling.openCount() > 0;
+    ui.connect.disabled = state !== 'idle' || !ready;
+    ui.remote.disabled = state !== 'idle';
+    ui.disconnect.hidden = state === 'idle';
+    ui.disconnect.textContent = state === 'connecting' ? '取消' : '断开';
+    ui.drop.setAttribute('aria-disabled', String(state !== 'connected'));
+  }
+  const uiState = () => (session ? 'connected' : link ? 'connecting' : 'idle');
+
+  /* ---------------- 信令 ---------------- */
+
+  function renderRelays(list) {
+    const open = list.filter((r) => r.state === 'open').length;
+    ui.relays.textContent = `信令通道 ${open}/${list.length} 可用：` +
+      list.map((r) => `${r.name} ${r.state === 'open' ? '✓' : r.state === 'connecting' ? '…' : '✗'}`).join('　');
+    ui.relays.className = 'hint' + (open ? '' : ' err');
+    setConnectedUI(uiState());
+    if (!open) {
+      if (!link) setStatus('所有信令通道都连不上，正在重试…可能是当前网络限制了外网连接，可以换个网络（如手机热点）试试。', 'err');
+      return;
+    }
+    if (!link && !session && /信令|正在启动/.test(ui.status.textContent)) {
+      setStatus('就绪。把配对码告诉对方，或输入对方的配对码。');
+    }
+    if (pendingConnect && CODE_RE.test(pendingConnect)) {
+      ui.remote.value = pendingConnect;
+      pendingConnect = '';
+      history.replaceState(null, '', location.pathname + location.search);
+      connectTo(ui.remote.value);
+    }
   }
 
-  /* ---------------- 信令 / Peer ---------------- */
+  async function startSignaling() {
+    // 同一个标签页刷新后保持配对码不变
+    myCode = sessionStorage.getItem('p2p-code');
+    if (!myCode || !CODE_RE.test(myCode)) {
+      myCode = randomCode();
+      sessionStorage.setItem('p2p-code', myCode);
+    }
+    ui.myCode.textContent = myCode;
+    ui.copyLink.disabled = false;
+    signaling = new Signaling({ relays: cfg.relays || [], onMessage: onSignal, onStatus: renderRelays });
+    await signaling.start(myCode);
+  }
 
-  function startPeer() {
-    myCode = randomCode();
-    const opts = { config: { iceServers: cfg.iceServers || [] }, debug: 1 };
-    if (cfg.peerServer) Object.assign(opts, cfg.peerServer);
-    peer = new Peer(ID_PREFIX + myCode, opts);
-
-    peer.on('open', () => {
-      ui.myCode.textContent = myCode;
-      ui.copyLink.disabled = false;
-      if (!conn) {
-        ui.connect.disabled = false;
-        setStatus('就绪。把配对码告诉对方，或输入对方的配对码。');
-      }
-      if (pendingConnect && CODE_RE.test(pendingConnect)) {
-        ui.remote.value = pendingConnect;
-        pendingConnect = '';
-        history.replaceState(null, '', location.pathname + location.search);
-        connectTo(ui.remote.value);
-      }
-    });
-
-    peer.on('connection', (c) => {
-      if (conn) {
-        // 只允许一个连接，拒绝其他人
-        c.on('open', () => c.close());
+  function onSignal(msg) {
+    const from = String(msg.from).toUpperCase();
+    if (!CODE_RE.test(from) || from === myCode || typeof msg.sid !== 'string') return;
+    switch (msg.t) {
+      case 'offer': return handleRemoteOffer(from, msg);
+      case 'answer':
+        if (link && link.role === 'caller' && link.remote === from && link.sid === msg.sid && !link.answered) {
+          link.answered = true;
+          link.pc.setRemoteDescription({ type: 'answer', sdp: String(msg.sdp) })
+            .catch((e) => fail('无法建立连接：' + e.message));
+        }
         return;
-      }
-      setStatus('有设备正在连接…');
-      bindConnection(c);
-    });
+      case 'busy':
+        if (link && link.remote === from && link.sid === msg.sid && !session) fail('对方正在与其他设备连接，请稍后再试。');
+        return;
+      case 'bye':
+        if (link && link.remote === from && link.sid === msg.sid) {
+          const wasConnected = !!session;
+          closeLink(false);
+          setStatus(wasConnected ? '对方已断开。' : '对方取消了连接。', 'err');
+        }
+        return;
+      default:
+    }
+  }
 
-    peer.on('disconnected', () => {
-      // 与信令服务器断开不影响已建立的 P2P 连接，静默重连即可
-      if (!peer.destroyed) setTimeout(() => !peer.destroyed && peer.disconnected && peer.reconnect(), 2000);
-    });
+  /* ---------------- WebRTC 连接 ---------------- */
 
-    peer.on('error', (err) => {
-      switch (err.type) {
-        case 'unavailable-id':
-          peer.destroy();
-          startPeer(); // 配对码被占用，换一个
-          return;
-        case 'peer-unavailable':
-          setStatus('找不到该配对码，请确认对方页面已打开且配对码正确。', 'err');
-          resetConnection();
-          return;
-        case 'network':
-        case 'server-error':
-        case 'socket-error':
-        case 'socket-closed':
-          setStatus('信令服务器连接异常，正在重试…（已建立的传输不受影响）', 'err');
-          return;
-        case 'browser-incompatible':
-          setStatus('当前浏览器不支持 WebRTC，请使用最新版 Chrome / Edge / Firefox / Safari。', 'err');
-          return;
-        default:
-          setStatus('出错：' + (err.message || err.type), 'err');
+  function newPeerConnection(l) {
+    const pc = new RTCPeerConnection({ iceServers: cfg.iceServers || [] });
+    pc.addEventListener('connectionstatechange', () => {
+      if (link !== l) return;
+      if (pc.connectionState === 'failed') {
+        fail('P2P 连接失败：双方网络可能无法直连（对称型 NAT）。可在 config.js 中配置 TURN 中转服务器。');
+      } else if (pc.connectionState === 'disconnected' && session) {
+        setStatus('连接不稳定，正在尝试恢复…', 'err');
+      } else if (pc.connectionState === 'connected' && session) {
+        setStatus(`已连接 ${l.remote}${l.route ? '（' + l.route + '）' : ''}`, 'ok');
       }
+    });
+    return pc;
+  }
+
+  // 非 trickle 模式：等本机候选地址收集完（或超时）再一次性发送 SDP，信令消息更少
+  function gathered(pc) {
+    if (pc.iceGatheringState === 'complete') return Promise.resolve();
+    return new Promise((resolve) => {
+      const t = setTimeout(done, ICE_GATHER_TIMEOUT);
+      function done() {
+        clearTimeout(t);
+        pc.removeEventListener('icegatheringstatechange', check);
+        resolve();
+      }
+      function check() { if (pc.iceGatheringState === 'complete') done(); }
+      pc.addEventListener('icegatheringstatechange', check);
     });
   }
 
-  function connectTo(code) {
+  function bindChannel(l, dc) {
+    dc.binaryType = 'arraybuffer';
+    dc.addEventListener('open', () => {
+      if (link !== l || session) return;
+      l.timers.forEach(clearTimeout); l.timers.forEach(clearInterval); l.timers = [];
+      session = new Session(dc, { onUpdate: render, onOffer: handleOffer, onClose: onSessionClose });
+      setConnectedUI('connected');
+      setStatus('已连接 ' + l.remote, 'ok');
+      detectRoute(l.pc).then((route) => {
+        l.route = route;
+        if (route && link === l && session) setStatus(`已连接 ${l.remote}（${route}）`, 'ok');
+      });
+    });
+  }
+
+  async function connectTo(code) {
     code = String(code).trim().toUpperCase();
     if (!CODE_RE.test(code)) { setStatus('配对码应为 6 位字母或数字。', 'err'); return; }
     if (code === myCode) { setStatus('不能连接自己。', 'err'); return; }
-    if (conn) return;
+    if (link) return;
+
+    const l = { sid: randomId(12), remote: code, role: 'caller', timers: [], answered: false };
+    link = l;
+    setConnectedUI('connecting');
     setStatus('正在连接 ' + code + ' …');
-    ui.connect.disabled = true;
-    bindConnection(peer.connect(ID_PREFIX + code, { reliable: true, serialization: 'raw' }));
+    try {
+      l.pc = newPeerConnection(l);
+      bindChannel(l, l.pc.createDataChannel('file', { ordered: true }));
+      await l.pc.setLocalDescription(await l.pc.createOffer());
+      await gathered(l.pc);
+      if (link !== l) return;
+      const offer = { t: 'offer', sid: l.sid, sdp: l.pc.localDescription.sdp };
+      const sendOffer = () => {
+        if (link !== l || l.answered) return;
+        signaling.send(code, offer).then((n) => {
+          if (!n && link === l) setStatus('信令通道全部不可用，等待恢复…', 'err');
+        });
+      };
+      sendOffer();
+      // 对方可能稍后才上线、或某条中继丢消息，定时重发直到收到应答
+      l.timers.push(setInterval(sendOffer, OFFER_RESEND));
+      l.timers.push(setTimeout(() => {
+        if (link !== l || session) return;
+        fail(l.answered
+          ? '连接超时：双方网络可能无法直连（对称型 NAT）。可在 config.js 中配置 TURN 中转服务器。'
+          : '对方没有响应：请确认对方页面已打开、配对码正确。');
+      }, CONNECT_TIMEOUT));
+    } catch (e) {
+      fail('无法创建连接：' + e.message);
+    }
   }
 
-  function bindConnection(c) {
-    conn = c;
-    const remoteCode = String(c.peer).replace(ID_PREFIX, '');
-    let opened = false;
-
-    // 15 秒内没打通大概率是 NAT 穿透失败
-    const timer = setTimeout(() => {
-      if (!opened && conn === c) {
-        setStatus('连接超时：双方网络可能无法直连（对称型 NAT）。可在 config.js 中配置 TURN 中转服务器。', 'err');
-        c.close();
-        resetConnection();
+  async function handleRemoteOffer(from, msg) {
+    // 对方重发的同一个 offer：把之前的 answer 再发一次
+    if (link && link.role === 'callee' && link.remote === from && link.sid === msg.sid) {
+      if (link.answer) signaling.send(from, link.answer);
+      return;
+    }
+    if (link) {
+      // 双方同时点了连接：配对码小的一方作为发起方，另一方让步
+      const glare = link.role === 'caller' && link.remote === from && !session;
+      if (!(glare && myCode > from)) {
+        if (!glare) signaling.send(from, { t: 'busy', sid: msg.sid });
+        return;
       }
-    }, 15000);
+      closeLink(false);
+    }
 
-    c.on('open', () => {
-      opened = true;
-      clearTimeout(timer);
-      session = new Session(c.dataChannel, { onUpdate: render, onOffer: handleOffer, onClose: onSessionClose });
-      setConnectedUI(true);
-      setStatus('已连接 ' + remoteCode, 'ok');
-      detectRoute(c).then((route) => {
-        if (route && conn === c) setStatus(`已连接 ${remoteCode}（${route}）`, 'ok');
-      });
-    });
-    c.on('close', () => { if (conn === c) onSessionClose('连接已断开'); });
-    c.on('error', (e) => setStatus('连接出错：' + (e.message || e.type), 'err'));
+    const l = { sid: msg.sid, remote: from, role: 'callee', timers: [] };
+    link = l;
+    setConnectedUI('connecting');
+    setStatus(from + ' 正在连接你…');
+    try {
+      l.pc = newPeerConnection(l);
+      l.pc.addEventListener('datachannel', (e) => bindChannel(l, e.channel));
+      await l.pc.setRemoteDescription({ type: 'offer', sdp: String(msg.sdp) });
+      await l.pc.setLocalDescription(await l.pc.createAnswer());
+      await gathered(l.pc);
+      if (link !== l) return;
+      l.answer = { t: 'answer', sid: l.sid, sdp: l.pc.localDescription.sdp };
+      signaling.send(from, l.answer);
+      l.timers.push(setTimeout(() => {
+        if (link === l && !session) fail('连接超时：双方网络可能无法直连（对称型 NAT）。可在 config.js 中配置 TURN 中转服务器。');
+      }, CONNECT_TIMEOUT));
+    } catch (e) {
+      fail('无法建立连接：' + e.message);
+    }
   }
 
   // 通过 getStats 判断是 P2P 直连还是 TURN 中转
-  async function detectRoute(c) {
-    const pc = c.peerConnection;
-    if (!pc) return '';
+  async function detectRoute(pc) {
     for (let i = 0; i < 5; i++) {
       try {
         const stats = await pc.getStats();
@@ -177,20 +263,31 @@
     return '';
   }
 
+  function fail(text) {
+    closeLink(true);
+    setStatus(text, 'err');
+  }
+
   function onSessionClose(reason) {
-    if (ui.dialog.open) ui.dialog.close('reject');
-    resetConnection();
+    if (!link) return;
+    closeLink(true);
     setStatus(reason + '。可重新输入配对码连接。', 'err');
   }
 
-  function resetConnection() {
+  /** 关闭当前连接；notify=true 时通知对方 */
+  function closeLink(notify) {
+    const l = link;
     const s = session;
-    const c = conn;
+    link = null;
     session = null;
-    conn = null;
+    if (ui.dialog.open) ui.dialog.close('reject');
     if (s) s.close();
-    if (c) { try { c.close(); } catch (_) { /* ignore */ } }
-    setConnectedUI(false);
+    if (l) {
+      l.timers.forEach(clearTimeout); l.timers.forEach(clearInterval);
+      if (notify && signaling) signaling.send(l.remote, { t: 'bye', sid: l.sid });
+      if (l.pc) { try { l.pc.close(); } catch (_) { /* ignore */ } }
+    }
+    setConnectedUI('idle');
   }
 
   /* ---------------- 接收 ---------------- */
@@ -341,30 +438,33 @@
   });
   ui.disconnect.addEventListener('click', () => {
     if (session && session.isBusy() && !confirm('正在传输，确定断开吗？')) return;
-    resetConnection();
-    setStatus('已断开。');
+    const wasConnected = !!session;
+    closeLink(true);
+    setStatus(wasConnected ? '已断开。' : '已取消连接。');
   });
   ui.copyLink.addEventListener('click', async () => {
-    const link = location.origin + location.pathname + '#' + myCode;
+    const url = location.origin + location.pathname + '#' + myCode;
     try {
-      await navigator.clipboard.writeText(link);
-      setStatus('邀请链接已复制，发给对方打开即可自动连接：' + link, 'ok');
+      await navigator.clipboard.writeText(url);
+      setStatus('邀请链接已复制，发给对方打开即可自动连接：' + url, 'ok');
     } catch (_) {
-      setStatus('邀请链接：' + link);
+      setStatus('邀请链接：' + url);
     }
   });
   window.addEventListener('beforeunload', (e) => {
     if (session && session.isBusy()) { e.preventDefault(); e.returnValue = ''; }
   });
+  window.addEventListener('pagehide', () => { if (link) closeLink(true); });
 
   ui.saveMode.textContent = canSaveToDisk
     ? '接收模式：直接写入磁盘（支持超大文件）'
     : '接收模式：内存（建议单个文件不超过 1GB，超大文件请用 Chrome / Edge）';
 
-  if (typeof window.Peer !== 'function') {
-    setStatus('PeerJS 加载失败，请检查网络后刷新页面。', 'err');
+  if (!window.RTCPeerConnection || !window.crypto || !crypto.subtle) {
+    setStatus('当前浏览器不支持 WebRTC 或加密接口，请使用最新版 Chrome / Edge / Firefox / Safari，并通过 https 打开。', 'err');
     return;
   }
-  setConnectedUI(false);
-  startPeer();
+  setConnectedUI('idle');
+  setStatus('正在启动信令通道…');
+  startSignaling().catch((e) => setStatus('启动失败：' + e.message, 'err'));
 })();

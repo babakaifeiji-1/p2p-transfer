@@ -26,7 +26,8 @@
         <button id="connectBtn" type="submit" disabled>连接</button>
         <button id="disconnectBtn" type="button" hidden>断开</button>
       </form>
-      <p id="status" role="status" aria-live="polite" class="status">正在连接信令服务器…</p>
+      <p id="status" role="status" aria-live="polite" class="status">正在启动…</p>
+      <p id="relayStatus" class="hint"></p>
     </section>
 
     <section aria-labelledby="send-title" class="card">
@@ -62,10 +63,8 @@
     </form>
   </dialog>
 
-  <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"
-          integrity="sha384-nlUQ8ZqCbvStErob+biJNzSgltf6urV3VGqhfIfzhmg9RXmpeRm76ELw0pYnKlTR"
-          crossorigin="anonymous"></script>
   <script src="config.js"></script>
+  <script src="signaling.js"></script>
   <script src="transfer.js"></script>
   <script src="app.js"></script>
 </body>
